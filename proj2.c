@@ -21,6 +21,8 @@
 #define SEM_NAME2 "/xjuris02.sem.hydro_queue"
 #define SEM_NAME3 "/xjuris02.sem.water_mutex"
 #define SEM_NAME4 "/xjuris02.sem.wait_mutex"
+#define SEM_NAME5 "/xjuris02.sem.hydro_barrier"
+#define SEM_NAME6 "/xjuris02.sem.making_water"
 
 #define SHARED_MEM_INIT(var) {(var) = mmap(NULL, sizeof(*(var)), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);}
 
@@ -31,12 +33,15 @@ int *line_cnt = NULL;
 int *oxy_bar_cnt = NULL;
 int *hydro_bar_cnt = NULL;
 int *molecule_cnt = NULL;
+int *water_barrier = NULL;
 
 //semafory
 sem_t *oxy_queue = NULL;
 sem_t *hydro_queue = NULL;
 sem_t *water_mutex = NULL;
 sem_t *wait_mutex = NULL;
+sem_t *hydro_barrier = NULL;
+sem_t *making_water = NULL;
 
 FILE *fp;
 
@@ -53,6 +58,8 @@ void semaphores_init() {
     sem_unlink(SEM_NAME2);
     sem_unlink(SEM_NAME3);
     sem_unlink(SEM_NAME4);
+    sem_unlink(SEM_NAME5);
+    sem_unlink(SEM_NAME6);
 
     if ((oxy_queue = sem_open(SEM_NAME1, O_CREAT | O_EXCL, 0666, 0)) == SEM_FAILED) {
 		perror("semaphore init failed\n");
@@ -73,6 +80,16 @@ void semaphores_init() {
 		perror("semaphore init failed\n");
 		exit(1);
 	}
+
+    if ((hydro_barrier = sem_open(SEM_NAME5, O_CREAT | O_EXCL, 0666, 0)) == SEM_FAILED) {
+		perror("semaphore init failed\n");
+		exit(1);
+	}
+
+    if ((making_water = sem_open(SEM_NAME6, O_CREAT | O_EXCL, 0666, 0)) == SEM_FAILED) {
+		perror("semaphore init failed\n");
+		exit(1);
+	}
 }
 
 //ziskani vstupnich parametru
@@ -85,7 +102,7 @@ int get_params(int argc, char **argv, Params *params) {
     params->NO = strtol(argv[1], NULL, 10);     //pocet kysliku
     params->NH = strtol(argv[2], NULL, 10);     //pocet vodiku
     params->TI = strtol(argv[3], NULL, 10) * 1000;   //maximalni cas v mikrosekundach, po ktery atom kysliku/vodiku ceka,
-                                                    //nez se zaradi do fronty na vytvareni molekul
+                                                     //nez se zaradi do fronty na vytvareni molekul
     params->TB = strtol(argv[4], NULL, 10) * 1000;   //maximalni cas v mikrosekundach nutny pro vytvoreni jedne molekuly
 
     if(params->TI < 0 || params->TB < 0 || params->NO <= 0 || params->NH <= 0) {
@@ -94,19 +111,6 @@ int get_params(int argc, char **argv, Params *params) {
     }
     return 0;
 }
-
-
-//nepouzivat wait_pid - aktivni cekani
-
-
-
-/*probouzeni - kdyz jakykoliv z jeho child procesu zmeni svuj stav -> returne se 
-
-pousteni urciteho poctu procesu - sem_post - tak, jak to ma ve funkci gen_riders (for loop nebo while loop)
-*/
-
-
-
 
 //funkce na vygenerovani delky cekani - parametr max_time je bud TI, nebo TB
 void wait_random_time(int max_time) {
@@ -123,7 +127,7 @@ void clean_all() {
     fclose(fp);
 }
 
-
+//proces pro kyslik
 void oxy_process(int oxy_atom_cnt, Params params) {
 
     wait_random_time(params.TI);
@@ -136,52 +140,49 @@ void oxy_process(int oxy_atom_cnt, Params params) {
     *oxy_bar_cnt += 1;
     sem_post(wait_mutex);
 
+    if(*hydro_bar_cnt >= 2) {
+        sem_wait(water_mutex);
+        sem_wait(wait_mutex);
+        *molecule_cnt += 1;
+        *line_cnt += 1;
+        fprintf(fp, "%d: O %d: creating molecule %d\n", *line_cnt, oxy_atom_cnt, *molecule_cnt);
+        fflush(fp);
+        *oxy_bar_cnt -= 1;
+        *water_barrier -= 1;
+        sem_post(wait_mutex);
+        sem_post(hydro_queue);
+        sem_post(hydro_queue);
+        wait_random_time(params.TB);
+        sem_post(hydro_barrier);
+        sem_post(hydro_barrier);
+    } 
+    else {
     //kyslik ceka ve fronte kysliku
     sem_wait(oxy_queue);
-
-    sem_wait(water_mutex);
-    if(*hydro_bar_cnt >= 2) {
-        sem_wait(wait_mutex);
-        molecule_cnt += 1;
-        sem_post(hydro_queue);
-        *line_cnt += 1;
-        fprintf(fp, "%d: ")
+    sem_wait(wait_mutex);
+    *line_cnt += 1;
+    fprintf(fp, "%d: O %d: creating molecule %d\n", *line_cnt, oxy_atom_cnt, *molecule_cnt);
+    fflush(fp);
+    *oxy_bar_cnt -= 1;
+    *water_barrier -= 1;
+    sem_post(wait_mutex);
+    wait_random_time(params.TB);
+    sem_post(hydro_barrier);
+    sem_post(hydro_barrier);
     }
 
-    //sem_wait(oxy_queue);  //za semaforem oxy_queue cekaji vytvorene kysliky
+    sem_wait(wait_mutex);
+    *line_cnt += 1;
+    fprintf(fp, "%d: O %d: molecule %d created\n", *line_cnt, oxy_atom_cnt, *molecule_cnt);
+    fflush(fp);
+    *water_barrier += 1;
+    sem_post(wait_mutex);
 
-/*
-    sem_wait(water_mutex);
-    if(*hydro_bar_cnt >= 2) {
-        *molecule_cnt += 1;
-        sem_post(hydro_queue);
-        *line_cnt += 1;
-        printf("%d: H %d: creating molecule %d\n", *line_cnt, *hydro_cnt, *molecule_cnt);
-        sem_post(hydro_queue);
-        *line_cnt += 1;
-        printf("%d: H %d: creating molecule %d\n", *line_cnt, *hydro_cnt, *molecule_cnt);       //FIXME vypisovat spravne id atomu
-        *hydro_bar_cnt -= 2;
-        sem_post(oxy_queue);
-        *line_cnt += 1;
-        *oxy_bar_cnt -= 1;
-        printf("%d: O %d: creating molecule %d\n", *line_cnt, *oxy_cnt, *molecule_cnt);
-        //wait_random_time(molec_time);
-        //kyslik informule vodiky, ze je molekula dokoncena
-
-        //TODO vodiky by se mely nejak uspat, a pak zase zavolat
-        *line_cnt += 1;
-        printf("%d: H %d: molecule %d created\n", *line_cnt, *hydro_cnt, *molecule_cnt);
-        *line_cnt += 1;
-        printf("%d: H %d: molecule %d created\n", *line_cnt, *hydro_cnt, *molecule_cnt);
-        *line_cnt += 1;
-        printf("%d: O %d: molecule %d created\n", *line_cnt, *oxy_cnt, *molecule_cnt);
-    }
-    else {
-        sem_wait(water_mutex);
-    }
-    */
+    if(*water_barrier == 3)
+        sem_post(water_mutex);
 }
 
+//proces pro vodik
 void hydro_process(int hydro_atom_cnt, Params params) {
 
     wait_random_time(params.TI);
@@ -193,13 +194,52 @@ void hydro_process(int hydro_atom_cnt, Params params) {
     fflush(fp);
     *hydro_bar_cnt += 1;
     sem_post(wait_mutex);
+    
 
+    if(*hydro_bar_cnt >= 2 && *oxy_bar_cnt >= 1) {
+        sem_wait(water_mutex);
+        sem_wait(wait_mutex);
+        *molecule_cnt += 1;
+        *line_cnt += 1;
+        fprintf(fp, "%d: H %d: creating molecule %d\n", *line_cnt, hydro_atom_cnt, *molecule_cnt);
+        fflush(fp);
+        *hydro_bar_cnt -= 1;
+        *water_barrier -= 1;
+        sem_post(wait_mutex);
+        sem_post(hydro_queue);
+        sem_post(oxy_queue);
+        //vodik bude cekat, dokud mu kyslik neoznami, ze je molekula dokoncena
+        sem_wait(hydro_barrier);
+    } 
+
+    else {
     //vodik ceka ve fronte vodiku
     sem_wait(hydro_queue);
+    sem_wait(wait_mutex);
+    *line_cnt += 1;
+    fprintf(fp, "%d: H %d: creating molecule %d\n", *line_cnt, hydro_atom_cnt, *molecule_cnt);
+    fflush(fp);
+    *hydro_bar_cnt -= 1;
+    *water_barrier -= 1;
+    sem_post(wait_mutex);
+    //vodik bude cekat, dokud mu kyslik neoznami, ze je molekula dokoncena
+    sem_wait(hydro_barrier);
+    }
 
+    sem_wait(wait_mutex);
+    *line_cnt += 1;
+    fprintf(fp, "%d: H %d: molecule %d created\n", *line_cnt, hydro_atom_cnt, *molecule_cnt);
+    fflush(fp);
+    *water_barrier += 1;
+    sem_post(wait_mutex);
+
+    if(*water_barrier == 3) {
+        sem_post(making_water);
+        sem_post(water_mutex);
+    }
 }
 
-
+//vygenerovani hlavniho procesu a vodik a kyslik procesu
 void process_gen(int *line_cnt, int *oxy_cnt, int *hydro_cnt, Params params) {
         pid_t pid_hydro;
         pid_t pid_oxy;
@@ -278,6 +318,8 @@ int main(int argc, char **argv) {
     SHARED_MEM_INIT(oxy_bar_cnt);
     SHARED_MEM_INIT(hydro_bar_cnt);
     SHARED_MEM_INIT(molecule_cnt);
+    SHARED_MEM_INIT(water_barrier);
+    *water_barrier = 3;
 
     process_gen(line_cnt, oxy_cnt, hydro_cnt, params);
 
