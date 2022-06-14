@@ -25,6 +25,7 @@
 #define SEM_NAME6 "/xjuris02.sem.hydro_mol_queue"
 #define SEM_NAME7 "/xjuris02.sem.oxy_mol_queue"
 
+//vytvori sdilenou pamet s pocatecni hodnotou 0
 #define SHARED_MEM_INIT(var) {(var) = mmap(NULL, sizeof(*(var)), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);}
 
 //sdilene pameti
@@ -67,36 +68,43 @@ void semaphores_init() {
     sem_unlink(SEM_NAME6);
     sem_unlink(SEM_NAME7);
 
+    //semafor, za kterym se bude tvorit rada s vytvorenymi kysliky
     if ((oxy_queue = sem_open(SEM_NAME1, O_CREAT | O_EXCL, 0666, 1)) == SEM_FAILED) {
 		perror("semaphore init failed\n");
 		exit(1);
 	}
 
+    //semafor, za kterym se bude tvorit rada s vytvorenymi vodiky
     if ((hydro_queue = sem_open(SEM_NAME2, O_CREAT | O_EXCL, 0666, 2)) == SEM_FAILED) {
 		perror("semaphore init failed\n");
 		exit(1);
 	}
 
+    //mutex, znacici, zda se muze tvorit molekula vody, ci nikoliv
     if ((water_mutex = sem_open(SEM_NAME3, O_CREAT | O_EXCL, 0666, 1)) == SEM_FAILED) {
 		perror("semaphore init failed\n");
 		exit(1);
 	}
 
+    //mutex, pokud se neco zapisuje nebo meni, ostatni procesy jsou zastavene
     if ((wait_mutex = sem_open(SEM_NAME4, O_CREAT | O_EXCL, 0666, 1)) == SEM_FAILED) {
 		perror("semaphore init failed\n");
 		exit(1);
 	}
 
+    //semafor, cekaji za nim vodiky tvorici molekulu, az jim da kyslik vedet, ze je molekula dokoncena
     if ((hydro_barrier = sem_open(SEM_NAME5, O_CREAT | O_EXCL, 0666, 0)) == SEM_FAILED) {
 		perror("semaphore init failed\n");
 		exit(1);
 	}
 
+    //vodiky cekajici ve fronte na tvorbu vody
     if ((hydro_mol_queue = sem_open(SEM_NAME6, O_CREAT | O_EXCL, 0666, 0)) == SEM_FAILED) {
 		perror("semaphore init failed\n");
 		exit(1);
 	}
 
+    //kysliky cekajici ve fronte na tvorbu vody
     if ((oxy_mol_queue = sem_open(SEM_NAME7, O_CREAT | O_EXCL, 0666, 0)) == SEM_FAILED) {
 		perror("semaphore init failed\n");
 		exit(1);
@@ -123,54 +131,46 @@ int get_params(int argc, char **argv, Params *params) {
     return 0;
 }
 
-//funkce na vygenerovani delky cekani - parametr max_time je bud TI, nebo TB
+//funkce na vygenerovani nahodne delky cekani z intervalu - parametr max_time je bud TI, nebo TB
 void wait_random_time(int max_time) {
     usleep(rand()%(max_time+1));
 }
 
 //funkce na uzavreni vseho, co bylo vytvoreno (otevreno) v prubehu programu
 void clean_all() {
+
+    //smazani alokovanych sdilenych pameti
     munmap(oxy_cnt, sizeof(oxy_cnt));
     munmap(line_cnt, sizeof(line_cnt));
+    munmap(hydro_cnt, sizeof(hydro_cnt));
+    munmap(oxy_bar_cnt, sizeof(oxy_bar_cnt));
+    munmap(hydro_bar_cnt, sizeof(hydro_bar_cnt));
+    munmap(molecule_cnt, sizeof(molecule_cnt));
+    munmap(water_barrier, sizeof(water_barrier));
+    munmap(making_water, sizeof(making_water));
+    munmap(oxy_passed, sizeof(oxy_passed));
+    munmap(hydro_passed, sizeof(hydro_passed));
+
+    //zruseni vsech semaforu
     sem_unlink(SEM_NAME1);
     sem_unlink(SEM_NAME2);
     sem_unlink(SEM_NAME3);
+    sem_unlink(SEM_NAME4);
+    sem_unlink(SEM_NAME5);
+    sem_unlink(SEM_NAME6);
+    sem_unlink(SEM_NAME7);
+
+    //zavreni souboru
     fclose(fp);
 }
 
-
-void water_process(int atom_cnt, int atom, Params params) {
-    //atom - 0: vodik, 1: kyslik
-
-    //vetev pro vodik
-    if(atom == 0) {
-        sem_wait(hydro_queue);
-        sem_wait(wait_mutex);
-        *line_cnt += 1;
-        fprintf(fp, "%d: H %d: creating molecule %d\n", *line_cnt, atom_cnt, *molecule_cnt);
-        fflush(fp);
-        *hydro_bar_cnt -= 1;
-        *water_barrier -= 1;
-        sem_post(wait_mutex);
-        //vodik bude cekat, dokud mu kyslik neoznami, ze je molekula dokoncena
-        sem_wait(hydro_barrier);
-    }
-
-    //vetev pro kyslik
-    else {
-        sem_wait(wait_mutex);
-        *line_cnt += 1;
-        fprintf(fp, "%d: O %d: creating molecule %d\n", *line_cnt, atom_cnt, *molecule_cnt);
-        fflush(fp);
-        *oxy_bar_cnt -= 1;
-        *water_barrier -= 1;
-        sem_post(wait_mutex);
-        wait_random_time(params.TB);
-        sem_post(hydro_barrier);
-        sem_post(hydro_barrier);
-    }
+//zavola se pri chybe tvoreni procesu (vsechny procesy, semafory i pamet se ukonci)
+void end_all(pid_t proc_id) {
+    clean_all();
+    kill(proc_id, SIGTERM);
+    kill(getpid(), SIGTERM);
+    exit(1);
 }
-
 
 //proces pro kyslik
 void oxy_process(int oxy_atom_cnt, Params params, int max_molecules) {
@@ -187,13 +187,15 @@ void oxy_process(int oxy_atom_cnt, Params params, int max_molecules) {
     //kyslik ceka v rade
     sem_wait(oxy_queue);
 
+    //pokud uz jsou vytvorene vsechny mozne molekuly, dalsi se uz nevytvori
     if(*molecule_cnt >= max_molecules) {
         sem_wait(wait_mutex);
         *line_cnt += 1;
         fprintf(fp, "%d: O %d: not enough H\n", *line_cnt, oxy_atom_cnt);
         fflush(fp);
+        sem_post(oxy_queue);
         sem_post(wait_mutex);
-
+        return;
     }
 
     sem_wait(water_mutex);
@@ -234,6 +236,7 @@ void oxy_process(int oxy_atom_cnt, Params params, int max_molecules) {
     fflush(fp);
     *water_barrier += 1;
 
+    //pokud vsechny atomy dokoncily tvoreni molekuly, pusti se dalsi tri atomy, ktere utvori dalsi molekulu
     if(*water_barrier == 3) {
         *water_barrier = 0;
         sem_post(oxy_queue);
@@ -261,11 +264,13 @@ void hydro_process(int hydro_atom_cnt, Params params, int max_molecules) {
     sem_post(wait_mutex);
     sem_wait(hydro_queue);
 
+    //pokud uz jsou vytvorene vsechny mozne molekuly, dalsi se uz nevytvori
     if(*molecule_cnt >= max_molecules) {
         sem_wait(wait_mutex);
         *line_cnt += 1;
         fprintf(fp, "%d: H %d: not enough O or H\n", *line_cnt, hydro_atom_cnt);
         fflush(fp);
+        sem_post(hydro_queue);
         sem_post(wait_mutex);
         return;
     }
@@ -305,6 +310,7 @@ void hydro_process(int hydro_atom_cnt, Params params, int max_molecules) {
     fflush(fp);
     *water_barrier += 1;
 
+    //pokud vsechny atomy dokoncily tvoreni molekuly, pusti se dalsi tri atomy, ktere utvori dalsi molekulu
     if(*water_barrier == 3) {
         *water_barrier = 0;
         sem_post(oxy_queue);
@@ -339,10 +345,9 @@ void process_gen(int *line_cnt, int *oxy_cnt, int *hydro_cnt, Params params) {
                 sem_post(wait_mutex);
                 hydro_process(i, params, max_molecules);
                 exit(0);
-            }else if (pid_hydro < 0) {
+            } else if (pid_hydro < 0) {
                 perror("error making hydrogen process\n");
-                clean_all();
-                exit(1);
+                end_all(id);
             }
         }
     }
@@ -363,26 +368,26 @@ void process_gen(int *line_cnt, int *oxy_cnt, int *hydro_cnt, Params params) {
                 exit(0);
             } else if (pid_oxy < 0) {
                 perror("error making oxygen process\n");
-                clean_all();
-                exit(1);
+                end_all(id);
             }
         }
     }
+    //pokud se vytvoril proces s id < 0, je to chyba a program se ukonci
     else {
         perror("error making process\n");
-        clean_all();
-        exit(1);
+        end_all(id);
     }
     return;
 }
 
 
-
 int main(int argc, char **argv) {
 
+    //ziskani vstupnich parametru
     Params params;
     get_params(argc, argv, &params);
 
+    //inicializace semaforu
     semaphores_init();
 
     //vytvori se .out soubor pro zapisovani vysledku
@@ -392,6 +397,7 @@ int main(int argc, char **argv) {
         exit(1);
     }
 
+    //inicializujeme sdileme pameti
     SHARED_MEM_INIT(line_cnt);
     SHARED_MEM_INIT(oxy_cnt);
     SHARED_MEM_INIT(hydro_cnt);
@@ -403,9 +409,8 @@ int main(int argc, char **argv) {
     SHARED_MEM_INIT(hydro_passed);
     SHARED_MEM_INIT(oxy_passed);
 
+    //samotny prubeh procesu
     process_gen(line_cnt, oxy_cnt, hydro_cnt, params);
-
-    //while (wait(NULL) > 0);
 
     clean_all();
 
